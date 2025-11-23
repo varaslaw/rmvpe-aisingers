@@ -33,6 +33,10 @@ from lib.train.data_utils import (
     DistributedBucketSampler,
 )
 
+# === NEW: Enhanced TensorBoard metrics tracker ===
+from utils.tensorboard_logger import TensorBoardMetricsTracker, format_training_log
+# =================================================
+
 if hps.version == "v1":
     from lib.infer_pack.models import (
         SynthesizerTrnMs256NSFsid as RVC_Model_f0,
@@ -50,6 +54,9 @@ from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from lib.train.process_ckpt import savee
 
 global_step = 0
+# === NEW: Global metrics tracker ===
+metrics_tracker = None
+# ===================================
 
 
 class EpochRecorder:
@@ -71,7 +78,6 @@ def main():
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
         n_gpus = 1
     if n_gpus < 1:
-        # patch to unblock people without gpus. there is probably a better way.
         print("NO GPU DETECTED: falling back to CPU - this may take a while")
         n_gpus = 1
     os.environ["MASTER_ADDR"] = "localhost"
@@ -95,10 +101,11 @@ def main():
 
 def run(rank, n_gpus, hps):
     global global_step
+    global metrics_tracker
+
     if rank == 0:
         logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
-        # utils.check_git_hash(hps.model_dir)
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
@@ -116,14 +123,11 @@ def run(rank, n_gpus, hps):
     train_sampler = DistributedBucketSampler(
         train_dataset,
         hps.train.batch_size * n_gpus,
-        # [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200,1400],  # 16s
-        [100, 200, 300, 400, 500, 600, 700, 800, 900],  # 16s
+        [100, 200, 300, 400, 500, 600, 700, 800, 900],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
     )
-    # It is possible that dataloader's workers are out of shared memory. Please try to raise your shared memory limit.
-    # num_workers=8 -> num_workers=4
     if hps.if_f0 == 1:
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
@@ -138,6 +142,12 @@ def run(rank, n_gpus, hps):
         persistent_workers=True,
         prefetch_factor=8,
     )
+
+    # === NEW: Initialize TensorBoard metrics tracker ===
+    if rank == 0:
+        metrics_tracker = TensorBoardMetricsTracker(log_dir=hps.model_dir)
+    # ===================================================
+
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
             hps.data.filter_length // 2 + 1,
@@ -170,8 +180,6 @@ def run(rank, n_gpus, hps):
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
-    # net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
-    # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     if torch.cuda.is_available():
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
@@ -179,21 +187,17 @@ def run(rank, n_gpus, hps):
         net_g = DDP(net_g)
         net_d = DDP(net_d)
 
-    try:  # 如果能加载自动resume
+    try:
         _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
-        )  # D多半加载没事
+        )
         if rank == 0:
             logger.info("loaded D")
-        # _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g,load_opt=0)
         _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
         )
         global_step = (epoch_str - 1) * len(train_loader)
-        # epoch_str = 1
-        # global_step = 0
-    except:  # 如果首次不能加载，加载pretrain
-        # traceback.print_exc()
+    except:
         epoch_str = 1
         global_step = 0
         if hps.pretrainG != "":
@@ -203,7 +207,7 @@ def run(rank, n_gpus, hps):
                 net_g.module.load_state_dict(
                     torch.load(hps.pretrainG, map_location="cpu")["model"]
                 )
-            )  ##测试不加载优化器
+            )
         if hps.pretrainD != "":
             if rank == 0:
                 logger.info("loaded pretrained %s" % (hps.pretrainD))
@@ -259,6 +263,9 @@ def run(rank, n_gpus, hps):
 def train_and_evaluate(
     rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache
 ):
+    global global_step
+    global metrics_tracker
+
     net_g, net_d = nets
     optim_g, optim_d = optims
     train_loader, eval_loader = loaders
@@ -266,19 +273,15 @@ def train_and_evaluate(
         writer, writer_eval = writers
 
     train_loader.batch_sampler.set_epoch(epoch)
-    global global_step
 
     net_g.train()
     net_d.train()
 
     # Prepare data iterator
     if hps.if_cache_data_in_gpu == True:
-        # Use Cache
         data_iterator = cache
         if cache == []:
-            # Make new cache
             for batch_idx, info in enumerate(train_loader):
-                # Unpack
                 if hps.if_f0 == 1:
                     (
                         phone,
@@ -301,7 +304,6 @@ def train_and_evaluate(
                         wave_lengths,
                         sid,
                     ) = info
-                # Load on CUDA
                 if torch.cuda.is_available():
                     phone = phone.cuda(rank, non_blocking=True)
                     phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -313,7 +315,6 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
                     wave = wave.cuda(rank, non_blocking=True)
                     wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
-                # Cache on list
                 if hps.if_f0 == 1:
                     cache.append(
                         (
@@ -347,17 +348,12 @@ def train_and_evaluate(
                         )
                     )
         else:
-            # Load shuffled cache
             shuffle(cache)
     else:
-        # Loader
         data_iterator = enumerate(train_loader)
 
-    # Run steps
     epoch_recorder = EpochRecorder()
     for batch_idx, info in data_iterator:
-        # Data
-        ## Unpack
         if hps.if_f0 == 1:
             (
                 phone,
@@ -372,7 +368,7 @@ def train_and_evaluate(
             ) = info
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
-        ## Load on CUDA
+        
         if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
             phone = phone.cuda(rank, non_blocking=True)
             phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -383,9 +379,7 @@ def train_and_evaluate(
             spec = spec.cuda(rank, non_blocking=True)
             spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
             wave = wave.cuda(rank, non_blocking=True)
-            # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
 
-        # Calculate
         with autocast(enabled=hps.train.fp16_run):
             if hps.if_f0 == 1:
                 (
@@ -429,9 +423,8 @@ def train_and_evaluate(
                 y_hat_mel = y_hat_mel.half()
             wave = commons.slice_segments(
                 wave, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
+            )
 
-            # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
             with autocast(enabled=False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
@@ -444,7 +437,6 @@ def train_and_evaluate(
         scaler.step(optim_d)
 
         with autocast(enabled=hps.train.fp16_run):
-            # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
             with autocast(enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
@@ -467,7 +459,6 @@ def train_and_evaluate(
                         epoch, 100.0 * batch_idx / len(train_loader)
                     )
                 )
-                # Amor For Tensorboard display
                 if loss_mel > 75:
                     loss_mel = 75
                 if loss_kl > 9:
@@ -519,7 +510,6 @@ def train_and_evaluate(
                     scalars=scalar_dict,
                 )
         global_step += 1
-    # /Run steps
 
     if epoch % hps.save_every_epoch == 0 and rank == 0:
         if hps.if_latest == 0:
@@ -573,6 +563,46 @@ def train_and_evaluate(
                     ),
                 )
             )
+
+    # === NEW: Enhanced metrics logging from TensorBoard ===
+    if rank == 0 and logger is not None:
+        current_mel = float(loss_mel.detach().cpu().item())
+        current_total = float(loss_gen_all.detach().cpu().item())
+
+        best_epoch, best_mel = metrics_tracker.find_best_epoch("loss/g/mel")
+        if best_epoch is None or best_mel is None:
+            best_epoch, best_mel = epoch, current_mel
+
+        patience = getattr(hps.train, "overtrain_patience", 20)
+        is_overtraining = metrics_tracker.check_overtraining(
+            current_epoch=epoch,
+            current_loss=current_mel,
+            patience=patience,
+        )
+
+        logger.info("Syncing metrics from TensorBoard...")
+        logger.info(
+            f"Last Mel: {current_mel * 100:.2f}% | "
+            f"Best Mel: {best_mel * 100:.2f}% (at epoch {best_epoch})"
+        )
+
+        pretty_line = format_training_log(
+            epoch=epoch,
+            total_epochs=hps.train.epochs,
+            mel_loss=current_mel,
+            total_loss=current_total,
+            best_mel=best_mel,
+            best_epoch=best_epoch,
+            is_overtraining=is_overtraining,
+        )
+        logger.info(pretty_line)
+
+        if is_overtraining:
+            logger.info(
+                f"[Possible Overtraining] No improvement for {patience} epochs. "
+                "Check loss/g/mel and loss/g/total in TensorBoard."
+            )
+    # ======================================================
 
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
